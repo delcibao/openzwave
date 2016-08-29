@@ -1,16 +1,14 @@
 //-----------------------------------------------------------------------------
-//
-//	Main.cpp
-//
-//	Minimal application to test OpenZWave.
+//	Open Z-Wave Monitor Program.
 //-----------------------------------------------------------------------------
-
 #include <unistd.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <iostream>
 #include <list>
 #include <string>
+#include <ctime>
+//
 #include <openzwave/Options.h>
 #include <openzwave/Manager.h>
 #include <openzwave/Driver.h>
@@ -22,19 +20,33 @@
 #include <openzwave/value_classes/ValueBool.h>
 #include <openzwave/platform/Log.h>
 #include <openzwave/value_classes/ValueID.h>
+#include <openzwave/command_classes/SwitchBinary.h>
+// 
+#include "mongoose.h"
+#include "Notify.h"
 
-#include "DoorWindowSensor.h"
+#define NUM_NODES 10
 
 #define Event_Detected  0x06
 #define Tamper_Switch   0x07
+#define Cover_Ajar      0x00
 #define Open            0xFF
 #define Close           0x00
-#define Basic_Value     "Basic"
-#define Battery_Level   "Battery Level"
-#define Alarm_Type      "Alarm Type"
-#define Alarm_Level     "Alarm Level"
-        
-//#define DEBUG 1
+#define Sw_On              1
+#define Sw_Off             0
+#define Switch_Command  0x25
+
+#ifdef DEBUG2
+    #warning In debug mode
+#endif
+
+
+
+#define MainController  1       //Main Controller, USB Stick
+#define WindowKitchen   2       // Magnetic switch sensor, Kitchen Windows.
+#define FrontDoor       3       // Magnetic switch sensor, front door.
+#define LivingRoom      4       // Movement sensor, living Room.
+#define Switch1         5       // Remote controlled outlet, TBD.
 
 using namespace OpenZWave;
 
@@ -43,8 +55,15 @@ bool temp = false;
 bool AlarmEnabled = 0;
 bool SensorTriggered = 0;
 
+string status1; 
+bool switch_value = 0;
+bool prev_switch_value=0;
+bool print_info = 0;
+
 static uint32_t g_homeId = 0;
 static bool g_initFailed = false;
+
+Notify notification;
 
 typedef struct
 {
@@ -53,23 +72,117 @@ typedef struct
 	bool		m_polled;
 	list<ValueID>	m_values;
 }NodeInfo;
-/**
- * Basic(0): 255,
- * Sensor(0): False, 
- *  ZWave+ Version(0): 1, 
- *  InstallerIcon(1): 3079,  
- * UserIcon(2): 3079,  
- * External Switch(1): Off,  
- * Alarm Type(0): 6,  
- * Alarm Level(1): 255,  SourceNodeId(2): 0,  Access Control(9): 22,  Burglar(10): 0,  Power Management(11): 0,  System(12): 0,  Emergency(13): 0,  Clock(14): 0,  Powerlevel(0): Normal,  Timeout(1): 0,  Set Powerlevel(2): False,  Test Node(3): 0,  Test Powerlevel(4): Normal,  Frame Count(5): 0,  Test(6): False,  Report(7): False,  Test Status(8): Failed,  Acked Frames(9): 0,  Battery Level(0): 100,  Minimum Wake-up Interval(1): 600,  Maximum Wake-up Interval(2): 604800,  Default Wake-up Interval(3): 3600,  Wake-up Interval Step(4): 200,  Wake-up Interval(0): 3600,  Library Version(0): 3,  Protocol Version(1): 4.05,  Application Version(2): 5.01,
+//openzwave
 
+class MyNode{
+public:
+//    Sensor(uint8_t id){nodeID = id;}
+    uint8_t getID(){return nodeID;};
+    void setID( uint8_t _node_ID){ nodeID = _node_ID;};
+    bool activity(){ 
+        bool ret_val = (detect != prev_detect) ;
+        prev_detect = detect;
+        return ret_val; };
+    uint8_t detect = 0;         // sensor in alarm 
+    uint8_t value = 0;          // 
+    uint8_t tamper = 0;         // cover ajar. warning.
+    time_t LastTimeStamp = 0;
+    uint8_t BatteryLevel = 0;
+    int32_t WakeupInterval = 0;
+    uint8_t prev_detect = 0;
+    uint8_t prev_value = 0;
+    uint8_t prev_tamper = 0;
+    MyNode (){ }
+    MyNode (uint8_t _node_ID){ nodeID = _node_ID;};
+    ~MyNode (){ }
+private:
+    uint8_t nodeID = 0;
+};
+
+/**
+Sensor sensor_window(WindowKitchen);
+Sensor sensor_door(FrontDoor);
+Sensor sensor_movement(LivingRoom);
 */
+
+MyNode sensor[NUM_NODES];
+uint8_t node_list[] = {WindowKitchen, FrontDoor, LivingRoom, Switch1};
 
 static list<NodeInfo*> g_nodes;
 static pthread_mutex_t g_criticalSection;
 static pthread_cond_t  initCond  = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t initMutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Mongoose
+static const char *s_http_port = "8080";
+static struct mg_serve_http_opts s_http_server_opts;
+
+static void handle_status_call(struct mg_connection *nc, struct http_message *hm)
+{
+    /* Send headers */
+    mg_printf(nc, "%s", "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Content-Type: text/json\r\n"
+            "\r\n");
+    /* Compute the result and send it back as a JSON object */
+    //result = strtod(n1, NULL) + strtod(n2, NULL);
+
+    pthread_mutex_lock(&g_criticalSection);                 
+    mg_printf_http_chunk(nc, "{ \"window\": %d, \"door\":%d, \"movement\":%d }", 
+    sensor[WindowKitchen].detect,
+    sensor[FrontDoor].detect,
+    sensor[LivingRoom].detect
+    );
+    pthread_mutex_unlock(&g_criticalSection);
+ 
+    mg_send_http_chunk(nc, "", 0); /* Send empty chunk, the end of response */
+}
+
+static void handle_switch_call(struct mg_connection *nc, struct http_message *hm)
+{
+    char n1[10];
+    /* Get form variables */
+    mg_get_http_var(&hm->body, "switch1", n1, sizeof(n1));
+    /* Send headers */
+    mg_printf(nc, "%s", "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Content-Type: text/json\r\n"
+            "\r\n");
+
+    /* Compute the result and send it back as a JSON object */
+    switch_value = atoi(n1);
+
+    mg_printf_http_chunk(nc, "{ \"result\": %d }", switch_value);
+    mg_send_http_chunk(nc, "", 0); /* Send empty chunk, the end of response */
+}
+
+static void ev_handler(struct mg_connection *nc, int ev, void *ev_data)
+{
+    struct http_message *hm = (struct http_message *) ev_data;
+    switch (ev) {
+        case MG_EV_HTTP_REQUEST:
+            if (mg_vcmp(&hm->uri, "/api/v1/status") == 0) {
+                handle_status_call(nc, hm); /* Handle RESTful call */
+            } else if (mg_vcmp(&hm->uri, "/api/v1/switch") == 0){
+                handle_switch_call(nc, hm); /* Handle RESTful call */
+            } else if (mg_vcmp(&hm->uri, "/printcontent") == 0) {
+                print_info = 1;
+                char buf[100] = {0};
+                memcpy(buf, hm->body.p,sizeof(buf) - 1 < hm->body.len ? sizeof(buf) - 1 : hm->body.len);
+                printf("%s\n", buf);
+                mg_printf(nc, "%s", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                mg_printf_http_chunk(nc, "<html><head><title>example</title></head><body><p>content printed</p></body></html>");
+                mg_send_http_chunk(nc, "", 0); /* Send empty chunk, the end of response */
+            } else {
+                mg_serve_http(nc, hm, s_http_server_opts); /* Serve static content */
+            }
+            break;
+        default:
+            break;
+  }
+}
+
+// openzwave
 //-----------------------------------------------------------------------------
 // <GetNodeInfo>
 // Return the NodeInfo object associated with this notification
@@ -91,6 +204,21 @@ NodeInfo* GetNodeInfo
 	}
 
 	return NULL;
+}
+
+void SwitchValue(uint8_t _nodeID, bool _val)
+{
+    for( list<NodeInfo*>::iterator it = g_nodes.begin(); it != g_nodes.end(); ++it) {
+        NodeInfo* nodeInfo = *it;
+        if( nodeInfo->m_nodeId == _nodeID ) {
+            for( list<ValueID>::iterator it2 = nodeInfo->m_values.begin();it2 != nodeInfo->m_values.end(); ++it2 ) {
+                ValueID v = *it2;
+                if( v.GetCommandClassId() == Switch_Command){
+                    Manager::Get()->SetValue(v, _val);
+                }
+            }
+        }
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -140,64 +268,81 @@ void OnNotification
                     // One of the node values has changed
                    
                     NodeInfo* nodeInfo = GetNodeInfo( _notification );
-                      
-                    std::cout << "Home ID: " << (uint32_t)nodeInfo->m_homeId+0 << ", Node ID: " << (uint8_t)nodeInfo->m_nodeId+0;
-/*
-                    for ( list<ValueID>::iterator it=nodeInfo->m_values.begin(); it != nodeInfo->m_values.end(); ++it)
-                    {
-                        ValueID v = *it;
-                        string str0 = Manager::Get()->GetValueLabel(v);
-                        string str1;
-                        Manager::Get()->GetValueAsString(v,&str1);
-                        cout << " " << str0.c_str() << ": " << str1.c_str();
-                    }
-                    cout << "\n";
-*/
-/**
-                    ValueID v = nodeInfo->m_values.front();
-                    string str0 = Manager::Get()->GetValueLabel(v);
-                    string str1;
-                    Manager::Get()->GetValueAsString(v,&str1);
-                    int value = std::stoi(str1);
-                    cout << str0.c_str() << ": " << value <<"\n";
-*/
+                    
+                    sensor[nodeInfo->m_nodeId].LastTimeStamp = time(0);
+                    sensor[nodeInfo->m_nodeId].setID(nodeInfo->m_nodeId);
+                    
+                    int8_t prev_value = 0;
+                    string str0, str1;
+                    uint8 value1;
+                    bool value2;
+#ifdef DEBUG2
+                    std::cout << "(Value Changed) Node ID: " << (uint8_t)nodeInfo->m_nodeId+0;
 
                     for ( list<ValueID>::iterator it=nodeInfo->m_values.begin(); it != nodeInfo->m_values.end(); ++it)
                     {
-                        string str0, str1, str2;
                         ValueID v = *it;
                         str0 = Manager::Get()->GetValueLabel(v);
-                        if(str0 == Basic_Value){                                    // Open: 0xFF, Close: 0x00
-                            Manager::Get()->GetValueAsString(v,&str1);
-                            int value = std::stoi (str1);
-                            std::cout << ", " << str0.c_str() << ": " << value;
+                        
+                        Manager::Get()->GetValueAsString(v,&str1);
+                        cout << ",[" << (uint8_t)v.GetType()+0 << "]" << str0.c_str() <<  "(0x" << std::hex << std::uppercase << v.GetCommandClassId()+0 << "): " << str1.c_str();
+                    }
+                    cout << "\n";
+#endif
+                    std::cout << std::dec << "(Value Changed) Node ID: " << (uint8_t)nodeInfo->m_nodeId+0;
+                    for ( list<ValueID>::iterator it=nodeInfo->m_values.begin(); it != nodeInfo->m_values.end(); ++it){
+                        ValueID v = *it;
+                        str0 = Manager::Get()->GetValueLabel(v);
+                        if(str0 == "Basic") {                                    // Open: 0xFF, Close: 0x00
+                            Manager::Get()->GetValueAsByte(v,&value1);
+                            std::cout << ", " << str0.c_str() << ": " << value1+0;
+                            sensor[nodeInfo->m_nodeId].detect = value1+0;
                         }
-                        if(str0 == Battery_Level){                            // In percentage
-                            Manager::Get()->GetValueAsString(v,&str1);
-                            int value = std::stoi (str1);
-                            std::cout << ", " << str0.c_str() << ": " << value;
+                        if(str0 == "Sensor") {                                    // Open: 0xFF, Close: 0x00
+                            Manager::Get()->GetValueAsBool(v,&value2);
+                            std::cout << ", " << str0.c_str() << ": " << value2+0;
+                            sensor[nodeInfo->m_nodeId].detect = value2+0;
                         }
-                        if(str0 == Alarm_Type){                               // Event Detected: 0x06, Tamper Switch: 0x07
-                            Manager::Get()->GetValueAsString(v,&str1);
-                            int value = std::stoi (str1);
-                            if (value == Event_Detected)
+                         if(str0 == "Switch") {
+                            Manager::Get()->GetValueAsBool(v,&value2);
+                            std::cout << ", " << str0.c_str() << ": " << value2+0;
+                            sensor[nodeInfo->m_nodeId].value = value2+0;
+                        }
+                        if(str0 == "Battery Level"){                            // In percentage
+                            Manager::Get()->GetValueAsByte(v,&value1);
+                            std::cout << ", " << str0.c_str() << ": " << value1+0;
+                            sensor[nodeInfo->m_nodeId].BatteryLevel = value1+0;
+                        }
+                        if(str0 == "Alarm Type"){                               // Event Detected: 0x06, Tamper Switch: 0x07
+                            Manager::Get()->GetValueAsByte(v,&value1);
+                            prev_value = value1;
+                            if (value1 == Event_Detected)
                                 std::cout << ", Event Detected: ";
-                            if (value == Tamper_Switch)
+                            if (value1 == Tamper_Switch)
                                 std::cout << ", Tamper Switch: ";
-                            //std::cout << ", " << str0.c_str() << ": " << str1.c_str();
+                            if (value1 == Cover_Ajar)
+                                 std::cout << ", Cover: ";
                         }
-                        if(str0 == Alarm_Level){                              // Open: 0xFF, Close: 0x00
-                            Manager::Get()->GetValueAsString(v,&str1);
-                            int value = std::stoi (str1);
-                            if (value == Open)
+                        if(str0 == "Alarm Level"){                              // Open: 0xFF, Close: 0x00
+                            Manager::Get()->GetValueAsByte(v,&value1);
+                            if (value1 == Open)
                                 std::cout << "Open";
-                            if (value == Close)
+                            if (value1 == Close)
                                 std::cout << "Close";
-                                
-                            //std::cout << ", " << str0.c_str() << ": " << value;
+                            if(prev_value == Event_Detected)
+                                sensor[nodeInfo->m_nodeId].detect = value1;
+                            if((prev_value == Tamper_Switch)||(prev_value == Cover_Ajar))
+                                sensor[nodeInfo->m_nodeId].tamper = value1;
+                        }
+                        if(str0 ==  "Wake-up Interval"){
+                            int32_t value;
+                            Manager::Get()->GetValueAsInt(v,&value);
+                            std::cout << ", " << str0.c_str() << ": " << value+0;
+                            sensor[nodeInfo->m_nodeId].WakeupInterval = value+0;   
                         }
                     }
                     std::cout << "\n";
+ 
                     /**
                       if (NodeInfo * nodeInfo = GetNodeInfo(_notification)) {
                  ValueID id = _notification->GetValueID();
@@ -275,27 +420,20 @@ void OnNotification
 		{
 			// We have received an event from the node, caused by a
 			// basic_set or hail message.
-                    /**
-                    NodeInfo* nodeInfo = GetNodeInfo( _notification );                      
-                    cout << "Home ID: " << (uint32_t)nodeInfo->m_homeId+0 << ", Node ID: " << (uint8_t)nodeInfo->m_nodeId+0 << " |";
-                    for ( list<ValueID>::iterator it=nodeInfo->m_values.begin(); it != nodeInfo->m_values.end(); ++it)
-                    {
-                        ValueID v = *it;
-                        string str0 = Manager::Get()->GetValueLabel(v);
-                        string str1;
-                        Manager::Get()->GetValueAsString(v,&str1);
-                        cout << " " << str0.c_str() << ": " << str1.c_str() <<"\n";
-                    }
-                    */
-                    
-                    NodeInfo* nodeInfo = GetNodeInfo( _notification );
-                    if( nodeInfo )
-                    {
-                        nodeInfo = nodeInfo;		// placeholder for real action
-                    }
-                    break;
-                    
-		}
+                        NodeInfo* nodeInfo = GetNodeInfo( _notification );
+
+                        std::cout << "(vent) Node ID: " << (uint8_t)nodeInfo->m_nodeId+0;
+                        sensor[nodeInfo->m_nodeId].LastTimeStamp = time(0);
+                        for ( list<ValueID>::iterator it=nodeInfo->m_values.begin(); it != nodeInfo->m_values.end(); ++it)
+                        {
+                            ValueID v = *it;
+                            string str0 = Manager::Get()->GetValueLabel(v);
+                            string str1;
+                            Manager::Get()->GetValueAsString(v,&str1);
+                            cout << " " << str0.c_str() <<  "(0x" << std::hex << std::uppercase << v.GetCommandClassId()+0 << "): " << str1.c_str();
+                        }
+                        cout << "\n";
+                }
 
 		case Notification::Type_PollingDisabled:
 		{
@@ -355,169 +493,199 @@ void OnNotification
 //-----------------------------------------------------------------------------
 int main( int argc, char* argv[] )
 {
+    struct mg_mgr mgr;
+    struct mg_connection *nc;
+    struct mg_bind_opts bind_opts;
+    int i;
+    char *cp;
+    const char *err_str;
+    const char *ssl_cert = NULL;
+
+    mg_mgr_init(&mgr, NULL);
+
+    /* Use current binary directory as document root */
+    if (argc > 0 && ((cp = strrchr(argv[0], DIRSEP)) != NULL)) {
+        *cp = '\0';
+        s_http_server_opts.document_root = argv[0];
+        //s_http_server_opts.document_root = ".";
+    }
+
+    /* Set HTTP server options */
+    memset(&bind_opts, 0, sizeof(bind_opts));
+    bind_opts.error_string = &err_str;
+    nc = mg_bind_opt(&mgr, s_http_port, ev_handler, bind_opts);
+    if (nc == NULL) {
+        fprintf(stderr, "Error starting server on port %s: %s\n", s_http_port, *bind_opts.error_string);
+    exit(1);
+    }
+
+    mg_set_protocol_http_websocket(nc);
+    s_http_server_opts.enable_directory_listing = "yes";
+
+    printf("Starting RESTful server on port %s, serving %s\n", s_http_port,
+         s_http_server_opts.document_root);
+
+  // openzwave
 	pthread_mutexattr_t mutexattr;
 
-	pthread_mutexattr_init ( &mutexattr );
-	pthread_mutexattr_settype( &mutexattr, PTHREAD_MUTEX_RECURSIVE );
-	pthread_mutex_init( &g_criticalSection, &mutexattr );
-	pthread_mutexattr_destroy( &mutexattr );
+    pthread_mutexattr_init ( &mutexattr );
+    pthread_mutexattr_settype( &mutexattr, PTHREAD_MUTEX_RECURSIVE );
+    pthread_mutex_init( &g_criticalSection, &mutexattr );
+    pthread_mutexattr_destroy( &mutexattr );
 
-	pthread_mutex_lock( &initMutex );
+    pthread_mutex_lock( &initMutex );
 
+    printf("Starting application with OpenZWave Version %s\n", Manager::getVersionAsString().c_str());
 
-	printf("Starting MinOZW with OpenZWave Version %s\n", Manager::getVersionAsString().c_str());
-
-	// Create the OpenZWave Manager.
-	// The first argument is the path to the config files (where the manufacturer_specific.xml file is located
-	// The second argument is the path for saved Z-Wave network state and the log file.  If you leave it NULL 
-	// the log file will appear in the program's working directory.
-	Options::Create( "/etc/openzwave/", "", "" );
-#ifdef DEBUG        
-	Options::Get()->AddOptionInt("SaveLogLevel", LogLevel_Debug);
-	Options::Get()->AddOptionInt("QueueLogLevel", LogLevel_Debug);
+    // Create the OpenZWave Manager.
+    // The first argument is the path to the config files (where the manufacturer_specific.xml file is located
+    // The second argument is the path for saved Z-Wave network state and the log file.  If you leave it NULL 
+    // the log file will appear in the program's working directory.
+    Options::Create( "/etc/openzwave/", "", "" );
+#if 0        
+    Options::Get()->AddOptionInt("SaveLogLevel", LogLevel_Debug);
+    Options::Get()->AddOptionInt("QueueLogLevel", LogLevel_Debug);
 #else
-	Options::Get()->AddOptionInt("SaveLogLevel", LogLevel_Error);
-	Options::Get()->AddOptionInt("QueueLogLevel", LogLevel_Error);
+    Options::Get()->AddOptionInt("SaveLogLevel", LogLevel_Error);
+    Options::Get()->AddOptionInt("QueueLogLevel", LogLevel_Error);
 #endif        
-	Options::Get()->AddOptionInt( "DumpTrigger", LogLevel_Error );
-	Options::Get()->AddOptionInt( "PollInterval", 500 );
-	Options::Get()->AddOptionBool( "IntervalBetweenPolls", true );
-	Options::Get()->AddOptionBool("ValidateValueChanges", true);
-	Options::Get()->Lock();
+    Options::Get()->AddOptionInt( "DumpTrigger", LogLevel_Error );
+    Options::Get()->AddOptionInt( "PollInterval", 500 );
+    Options::Get()->AddOptionBool( "IntervalBetweenPolls", true );
+    Options::Get()->AddOptionBool("ValidateValueChanges", true);
+    Options::Get()->Lock();
 
-	Manager::Create();
+    Manager::Create();
 
-	// Add a callback handler to the manager.  The second argument is a context that
-	// is passed to the OnNotification method.  If the OnNotification is a method of
-	// a class, the context would usually be a pointer to that class object, to
-	// avoid the need for the notification handler to be a static.
-	Manager::Get()->AddWatcher( OnNotification, NULL );
+    // Add a callback handler to the manager.  The second argument is a context that
+    // is passed to the OnNotification method.  If the OnNotification is a method of
+    // a class, the context would usually be a pointer to that class object, to
+    // avoid the need for the notification handler to be a static.
+    Manager::Get()->AddWatcher( OnNotification, NULL );
 
-	// Add a Z-Wave Driver
-	// Modify this line to set the correct serial port for your PC interface.
-/*
-#ifdef DARWIN
-	string port = "/dev/cu.usbserial";
-#elif WIN32
-        string port = "\\\\.\\COM6";
-#else
-	string port = "/dev/ttyUSB0";
-#endif
-*/
-string port = "/dev/ttyACM0";
+    // Add a Z-Wave Driver
+    // Modify this line to set the correct serial port for your PC interface.
+    string port = "/dev/ttyACM0";
+    Manager::Get()->AddDriver((argc > 1) ? argv[1] : port);
 
-    if ( argc > 1 )
-	{
-		port = argv[1];
-	}
-	if( strcasecmp( port.c_str(), "usb" ) == 0 )
-	{
-		Manager::Get()->AddDriver( "HID Controller", Driver::ControllerInterface_Hid );
-	}
-	else
-	{
-		Manager::Get()->AddDriver( port );
-	}
+    // Now we just wait for either the AwakeNodesQueried or AllNodesQueried notification,
+    // then write out the config file.
+    // In a normal app, we would be handling notifications and building a UI for the user.
+    pthread_cond_wait( &initCond, &initMutex );
 
-	// Now we just wait for either the AwakeNodesQueried or AllNodesQueried notification,
-	// then write out the config file.
-	// In a normal app, we would be handling notifications and building a UI for the user.
-	pthread_cond_wait( &initCond, &initMutex );
+    // Since the configuration file contains command class information that is only 
+    // known after the nodes on the network are queried, wait until all of the nodes 
+    // on the network have been queried (at least the "listening" ones) before
+    // writing the configuration file.  (Maybe write again after sleeping nodes have
+    // been queried as well.)
+    if( !g_initFailed )
+    {
+            // The section below demonstrates setting up polling for a variable.  In this simple
+            // example, it has been hardwired to poll COMMAND_CLASS_BASIC on the each node that 
+            // supports this setting.
+            pthread_mutex_lock( &g_criticalSection );
+            for( list<NodeInfo*>::iterator it = g_nodes.begin(); it != g_nodes.end(); ++it )
+            {
+                    NodeInfo* nodeInfo = *it;
 
-	// Since the configuration file contains command class information that is only 
-	// known after the nodes on the network are queried, wait until all of the nodes 
-	// on the network have been queried (at least the "listening" ones) before
-	// writing the configuration file.  (Maybe write again after sleeping nodes have
-	// been queried as well.)
-	if( !g_initFailed )
-	{
+                    // skip the controller (most likely node 1)
+                    if( nodeInfo->m_nodeId == 1) continue;
 
-		// The section below demonstrates setting up polling for a variable.  In this simple
-		// example, it has been hardwired to poll COMMAND_CLASS_BASIC on the each node that 
-		// supports this setting.
-		pthread_mutex_lock( &g_criticalSection );
-		for( list<NodeInfo*>::iterator it = g_nodes.begin(); it != g_nodes.end(); ++it )
-		{
-			NodeInfo* nodeInfo = *it;
-
-			// skip the controller (most likely node 1)
-			if( nodeInfo->m_nodeId == 1) continue;
-
-			for( list<ValueID>::iterator it2 = nodeInfo->m_values.begin(); it2 != nodeInfo->m_values.end(); ++it2 )
-			{
-				ValueID v = *it2;
-				if( v.GetCommandClassId() == 0x20 )
-				{
+                    for( list<ValueID>::iterator it2 = nodeInfo->m_values.begin(); it2 != nodeInfo->m_values.end(); ++it2 )
+                    {
+                            ValueID v = *it2;
+                            if( v.GetCommandClassId() == 0x20 )
+                            {
 //					Manager::Get()->EnablePoll( v, 2 );		// enables polling with "intensity" of 2, though this is irrelevant with only one value polled
-					break;
-				}
-			}
-		}
-		pthread_mutex_unlock( &g_criticalSection );
+                                    break;
+                            }
+                    }
+            }
+            pthread_mutex_unlock( &g_criticalSection );
 
-		// If we want to access our NodeInfo list, that has been built from all the
-		// notification callbacks we received from the library, we have to do so
-		// from inside a Critical Section.  This is because the callbacks occur on other 
-		// threads, and we cannot risk the list being changed while we are using it.  
-		// We must hold the critical section for as short a time as possible, to avoid
-		// stalling the OpenZWave drivers.
-		// At this point, the program just waits for 3 minutes (to demonstrate polling),
-		// then exits
-/**
-		for( int i = 0; i < 60*3; i++ )
-		{
-			pthread_mutex_lock( &g_criticalSection );
-			// but NodeInfo list and similar data should be inside critical section
-			pthread_mutex_unlock( &g_criticalSection );
-			sleep(1);
-		}
-*/
-                while(true) {
-                    // Press ENTER to gracefully exit.
-                    char charValue = cin.get();
-                    if ( charValue == 'q') {
-                        Manager::Get()->WriteConfig( g_homeId );
-                        break;
-                      }
-                    if ( charValue == 'e' ){
-                        AlarmEnabled = 1;
-                        cout << "Alarm Enabled" << endl;
+
+
+            while(true) {
+                // Press ENTER to gracefully exit.
+                //char charValue = cin.get();
+                char charValue = 0;
+                if ( charValue == 'q') {
+                    Manager::Get()->WriteConfig( g_homeId );
+                    break;
+                  }
+                if ( charValue == 'e' ){
+                    AlarmEnabled = 1;
+                    cout << "Alarm Enabled" << endl;
+                }
+                if ( charValue == 'd'){
+                    AlarmEnabled = 0;
+                    cout << "Alarm Disabled" << endl;
+                }
+                if (prev_switch_value != switch_value){
+                    cout << "send command to switch" << endl;
+                    pthread_mutex_lock(&g_criticalSection);
+                    SwitchValue(Switch1,switch_value);
+                    pthread_mutex_unlock(&g_criticalSection);
+                    prev_switch_value = switch_value;
+                }
+                if ( print_info){
+                    print_info = 0;
+                    pthread_mutex_lock(&g_criticalSection);
+                    for (int n=0 ; n<0 ; ++n ){
+                        cout << "*** ID: " << std::dec << sensor[node_list[n]].getID()+0 << endl;
+                        cout << "* Detect: " << std::dec << sensor[node_list[n]].detect+0 << endl;
+                        cout << "* Tamper: " << std::dec << sensor[node_list[n]].tamper+0 << endl;
+                        cout << "* Battery Level: " << std::dec << sensor[node_list[n]].BatteryLevel+0 << " %" << endl;
+                        cout << "* Wake-up interval: " << std::dec << sensor[node_list[n]].WakeupInterval+0 << " seconds." << endl;
+                        cout << "* Last time: " <<  std::dec << (uint32_t)(time(0) - sensor[node_list[n]].LastTimeStamp)+0<< " seconds ago." << endl;
+                        cout << "****" << endl;
                     }
-                    if ( charValue == 'd'){
-                        AlarmEnabled = 0;
-                        cout << "Alarm Disabled" << endl;
-                    }
-                    pthread_mutex_lock( &g_criticalSection );
-                    if(SensorTriggered && AlarmEnabled){
-                        cout << "Intruder!" << endl;
-                        SensorTriggered = 0;
-                    }
-                    if(SensorTriggered && ~AlarmEnabled){
-                        cout << "Notification" << endl;
-                        SensorTriggered = 0;
-                    }
-                    pthread_mutex_unlock( &g_criticalSection );
+                    pthread_mutex_unlock(&g_criticalSection);
                 }
                 
-		Driver::DriverData data;
-		Manager::Get()->GetDriverStatistics( g_homeId, &data );
-		printf("SOF: %d ACK Waiting: %d Read Aborts: %d Bad Checksums: %d\n", data.m_SOFCnt, data.m_ACKWaiting, data.m_readAborts, data.m_badChecksum);
-		printf("Reads: %d Writes: %d CAN: %d NAK: %d ACK: %d Out of Frame: %d\n", data.m_readCnt, data.m_writeCnt, data.m_CANCnt, data.m_NAKCnt, data.m_ACKCnt, data.m_OOFCnt);
-		printf("Dropped: %d Retries: %d\n", data.m_dropped, data.m_retries);
-	}
+                pthread_mutex_lock(&g_criticalSection);
+                if(sensor[WindowKitchen].activity()){
+                    cout << "Movement sensor activated!" << endl;
+                    time_t t = time(0);   // get time now
+                    struct tm * now = localtime( & t );
+                    cout << (now->tm_hour + 1900) << ':' << (now->tm_min << ':'<<  now->tm_sec << endl;
+                    notification.send("Security","Movement sensor activity" );
+                }
+                pthread_mutex_unlock(&g_criticalSection);
 
-	// program exit (clean up)
-	if( strcasecmp( port.c_str(), "usb" ) == 0 )
-	{
-		Manager::Get()->RemoveDriver( "HID Controller" );
-	}
-	else
-	{
-		Manager::Get()->RemoveDriver( port );
-	}
-	Manager::Get()->RemoveWatcher( OnNotification, NULL );
-	Manager::Destroy();
-	Options::Destroy();
-	pthread_mutex_destroy( &g_criticalSection );
-	return 0;
+                if(SensorTriggered && AlarmEnabled){
+                    cout << "Intruder!" << endl;
+                    SensorTriggered = 0;
+                }
+                if(SensorTriggered && ~AlarmEnabled){
+                    cout << "Notification" << endl;
+                    SensorTriggered = 0;
+                }
+                //pthread_mutex_unlock( &g_criticalSection );
+                
+                mg_mgr_poll(&mgr, 1000);
+            }
+
+            mg_mgr_free(&mgr);
+            
+            Driver::DriverData data;
+            Manager::Get()->GetDriverStatistics( g_homeId, &data );
+            printf("SOF: %d ACK Waiting: %d Read Aborts: %d Bad Checksums: %d\n", data.m_SOFCnt, data.m_ACKWaiting, data.m_readAborts, data.m_badChecksum);
+            printf("Reads: %d Writes: %d CAN: %d NAK: %d ACK: %d Out of Frame: %d\n", data.m_readCnt, data.m_writeCnt, data.m_CANCnt, data.m_NAKCnt, data.m_ACKCnt, data.m_OOFCnt);
+            printf("Dropped: %d Retries: %d\n", data.m_dropped, data.m_retries);
+    }
+    // program exit (clean up)
+    if( strcasecmp( port.c_str(), "usb" ) == 0 )
+    {
+            Manager::Get()->RemoveDriver( "HID Controller" );
+    }
+    else
+    {
+            Manager::Get()->RemoveDriver( port );
+    }
+    Manager::Get()->RemoveWatcher( OnNotification, NULL );
+    Manager::Destroy();
+    Options::Destroy();
+    pthread_mutex_destroy( &g_criticalSection );
+    return 0;
 }
