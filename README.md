@@ -1,3 +1,3 @@
 # openzwave
-Open Z-wave example for a Door Window Sensor
+Open Z-wave program for a Door Window Sensor / Wall switch
 based on the minozw example of the openzwave library
